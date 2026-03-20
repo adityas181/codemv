@@ -40,7 +40,7 @@ class RabbitMQService(Service):
     def __init__(self) -> None:
         self.config = RabbitMQConfig()
         self._connection: AbstractRobustConnection | None = None
-        self._channel: Channel | None = None
+        self._channels: dict[str, Channel] = {}
         self._queues: dict[str, Queue] = {}
         self._consumer_tags: list[str] = []
         self._started = False
@@ -54,7 +54,14 @@ class RabbitMQService(Service):
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Connect to RabbitMQ, declare queues, and start consumers."""
+        """Connect to RabbitMQ, declare queues, and start consumers.
+
+        Each queue gets its own channel so that prefetch_count is per-queue
+        rather than shared across all queues on a single channel.
+        Old messages from previous server runs are purged on startup since
+        the in-memory job queues (EventManager, asyncio.Queue) are ephemeral
+        and old job_ids cannot be processed.
+        """
         if not self.config.enabled:
             logger.info("RabbitMQ is disabled (RABBITMQ_ENABLED != true). Skipping.")
             return
@@ -65,8 +72,7 @@ class RabbitMQService(Service):
                 self.config.url,
                 client_properties={"connection_name": "agentcore"},
             )
-            self._channel = await self._connection.channel()
-            await self._channel.set_qos(prefetch_count=self.config.prefetch_count)
+            logger.info("RabbitMQ connection established")
 
             # All queues with their consumer handlers
             queue_consumers = [
@@ -78,10 +84,24 @@ class RabbitMQService(Service):
             ]
 
             for queue_name, handler in queue_consumers:
-                q = await self._channel.declare_queue(queue_name, durable=True)
+                # Each queue gets its own channel so prefetch is independent
+                channel = await self._connection.channel()
+                await channel.set_qos(prefetch_count=self.config.prefetch_count)
+                self._channels[queue_name] = channel
+
+                q = await channel.declare_queue(queue_name, durable=True)
+
+                # Purge old messages — they reference job_ids from a previous
+                # server session whose in-memory queues no longer exist.
+                purged = await q.purge()
+                if purged:
+                    logger.info(f"Purged {purged} stale messages from {queue_name}")
+
                 self._queues[queue_name] = q
                 tag = await q.consume(handler)
                 self._consumer_tags.append(tag)
+                logger.info(f"Consumer registered on {queue_name} (tag={tag})")
+
                 # Init stats for each queue
                 short_name = queue_name.split(".")[-1]
                 self._stats[f"{short_name}_published"] = 0
@@ -111,8 +131,9 @@ class RabbitMQService(Service):
                 pass
 
         try:
-            if self._channel and not self._channel.is_closed:
-                await self._channel.close()
+            for channel in self._channels.values():
+                if channel and not channel.is_closed:
+                    await channel.close()
             if self._connection and not self._connection.is_closed:
                 await self._connection.close()
         except Exception:
@@ -150,8 +171,9 @@ class RabbitMQService(Service):
         return await self._publish(self.config.orchestrator_queue, job_data)
 
     async def _publish(self, queue_name: str, job_data: dict[str, Any]) -> str:
-        if not self._channel or self._channel.is_closed:
-            msg = "RabbitMQ channel is not available"
+        channel = self._channels.get(queue_name)
+        if not channel or channel.is_closed:
+            msg = f"RabbitMQ channel for {queue_name} is not available"
             raise RuntimeError(msg)
 
         message_id = job_data.get("job_id", str(uuid.uuid4()))
@@ -164,11 +186,11 @@ class RabbitMQService(Service):
             delivery_mode=aio_pika.DeliveryMode.PERSISTENT,
         )
 
-        await self._channel.default_exchange.publish(message, routing_key=queue_name)
+        await channel.default_exchange.publish(message, routing_key=queue_name)
 
         short_name = queue_name.split(".")[-1]
         self._stats[f"{short_name}_published"] = self._stats.get(f"{short_name}_published", 0) + 1
-        logger.debug(f"Published job {message_id} to {queue_name}")
+        logger.info(f"[RabbitMQ] Published job {message_id} to {queue_name}")
         return message_id
 
     # ------------------------------------------------------------------
